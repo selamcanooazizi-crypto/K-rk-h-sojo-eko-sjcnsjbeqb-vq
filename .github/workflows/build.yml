@@ -1,0 +1,338 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.12
+      - name: Generate project
+        run: |
+          mkdir -p src/main/resources src/main/java/dev/itemdrop
+          FAPI=$(curl -s https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml | grep -o '<version>[^<]*+1.21.4</version>' | tail -1 | sed 's/<[^>]*>//g')
+          YARN=$(curl -s https://maven.fabricmc.net/net/fabricmc/yarn/maven-metadata.xml | grep -o '<version>1.21.4+build[^<]*</version>' | tail -1 | sed 's/<[^>]*>//g')
+          FAPI=${FAPI:-0.119.3+1.21.4}
+          YARN=${YARN:-1.21.4+build.8}
+          echo "Fabric API: $FAPI / Yarn: $YARN"
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'itemdrop'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'fabric-loom' version '1.10-SNAPSHOT' }
+          version = '1.0.0'
+          base { archivesName = 'itemdrop' }
+          repositories { mavenCentral() }
+          dependencies {
+              minecraft 'com.mojang:minecraft:1.21.4'
+              mappings 'net.fabricmc:yarn:YARN_VERSION:v2'
+              modImplementation 'net.fabricmc:fabric-loader:0.16.10'
+              modImplementation 'net.fabricmc.fabric-api:fabric-api:FAPI_VERSION'
+          }
+          tasks.withType(JavaCompile).configureEach { options.release = 21 }
+          EOF
+          sed -i "s/YARN_VERSION/$YARN/; s/FAPI_VERSION/$FAPI/" build.gradle
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "itemdrop",
+            "version": "1.0.0",
+            "name": "Item Drop",
+            "environment": "client",
+            "entrypoints": { "client": ["dev.itemdrop.ItemDropMod"] },
+            "depends": { "fabricloader": ">=0.16.10", "minecraft": "~1.21.4", "java": ">=21", "fabric-api": "*" }
+          }
+          EOF
+          cat > src/main/java/dev/itemdrop/ItemDropMod.java <<'EOF'
+
+          package dev.itemdrop;
+
+          import com.mojang.blaze3d.systems.RenderSystem;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
+          import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+          import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+          import net.fabricmc.fabric.api.client.screen.v1.Screens;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.GameMenuScreen;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.render.BufferBuilder;
+          import net.minecraft.client.render.BufferRenderer;
+          import net.minecraft.client.render.BuiltBuffer;
+          import net.minecraft.client.render.ShaderProgramKeys;
+          import net.minecraft.client.render.Tessellator;
+          import net.minecraft.client.render.VertexFormat;
+          import net.minecraft.client.render.VertexFormats;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.ItemEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.hit.HitResult;
+          import net.minecraft.util.math.MathHelper;
+          import net.minecraft.util.math.Vec3d;
+          import net.minecraft.world.RaycastContext;
+          import org.joml.Matrix4f;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+
+          public class ItemDropMod implements ClientModInitializer {
+
+              static boolean enabled = true;
+              static int speed = 3;
+
+              static class DropPath {
+                  final List<Vec3d> points = new ArrayList<>();
+                  int rgb;
+              }
+
+              record Death(Vec3d pos, long tick) {}
+
+              static final List<DropPath> paths = new ArrayList<>();
+              static final List<Death> deaths = new ArrayList<>();
+              static final Set<Integer> deadSeen = new HashSet<>();
+              static final Map<Integer, Long> firstSeen = new HashMap<>();
+              static final Set<Integer> tracked = new HashSet<>();
+              static long tickCount;
+              static KeyBinding menuKey;
+
+              @Override
+              public void onInitializeClient() {
+                  menuKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "Item Drop Menu", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_G, "Item Drop"));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (menuKey.wasPressed()) {
+                          if (client.currentScreen == null) client.setScreen(new Menu(null));
+                      }
+                      tick(client);
+                  });
+                  WorldRenderEvents.LAST.register(ItemDropMod::render);
+
+                  // Mobil: klavye yok, o yuzden Esc (pause) menusune buton ekle
+                  ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
+                      if (screen instanceof GameMenuScreen) {
+                          Screens.getButtons(screen).add(ButtonWidget.builder(Text.literal("Item Drop"),
+                                  b -> client.setScreen(new Menu(screen))).dimensions(w - 110, 6, 104, 24).build());
+                      }
+                  });
+              }
+
+              static void tick(MinecraftClient mc) {
+                  paths.clear();
+                  if (mc.world == null || mc.player == null) {
+                      deaths.clear(); deadSeen.clear(); firstSeen.clear(); tracked.clear();
+                      return;
+                  }
+                  if (!enabled) return;
+                  tickCount++;
+
+                  Set<Integer> deadNow = new HashSet<>();
+                  for (Entity e : mc.world.getEntities()) {
+                      if (e instanceof PlayerEntity p && p.isDead()) {
+                          deadNow.add(p.getId());
+                          if (deadSeen.add(p.getId())) deaths.add(new Death(p.getPos(), tickCount));
+                      }
+                  }
+                  deadSeen.retainAll(deadNow);
+                  deaths.removeIf(d -> tickCount - d.tick() > 60);
+
+                  Set<Integer> present = new HashSet<>();
+                  for (Entity e : mc.world.getEntities()) {
+                      if (!(e instanceof ItemEntity item)) continue;
+                      int id = item.getId();
+                      present.add(id);
+                      long first = firstSeen.computeIfAbsent(id, k -> tickCount);
+                      if (!tracked.contains(id) && tickCount - first <= 6) {
+                          for (Death d : deaths) {
+                              if (d.pos().squaredDistanceTo(item.getPos()) < 36.0) { tracked.add(id); break; }
+                          }
+                      }
+                      if (tracked.contains(id) && !item.isOnGround() && paths.size() < 24) {
+                          DropPath p = simulate(mc, item);
+                          if (p.points.size() > 1) paths.add(p);
+                      }
+                  }
+                  firstSeen.keySet().retainAll(present);
+                  tracked.retainAll(present);
+              }
+
+              static DropPath simulate(MinecraftClient mc, ItemEntity item) {
+                  DropPath path = new DropPath();
+                  path.rgb = MathHelper.hsvToRgb((item.getId() * 0.137f) % 1f, 0.75f, 1f);
+                  Vec3d pos = item.getPos();
+                  Vec3d vel = item.getVelocity();
+                  path.points.add(pos);
+                  for (int i = 0; i < 200; i++) {
+                      if (!item.hasNoGravity()) vel = vel.add(0, -0.04, 0);
+                      Vec3d next = pos.add(vel);
+                      var hit = mc.world.raycast(new RaycastContext(pos, next,
+                              RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, item));
+                      if (hit.getType() != HitResult.Type.MISS) { path.points.add(hit.getPos()); break; }
+                      pos = next;
+                      path.points.add(pos);
+                      vel = vel.multiply(0.98, 0.98, 0.98);
+                      if (pos.y < mc.world.getBottomY()) break;
+                  }
+                  return path;
+              }
+
+              static void render(WorldRenderContext ctx) {
+                  if (!enabled || paths.isEmpty()) return;
+                  MatrixStack matrices = ctx.matrixStack();
+                  if (matrices == null) return;
+                  Vec3d cam = ctx.camera().getPos();
+
+                  RenderSystem.enableBlend();
+                  RenderSystem.defaultBlendFunc();
+                  RenderSystem.disableDepthTest();
+                  RenderSystem.disableCull();
+                  // glLineWidth mobilde (MobileGlues) calismiyor: cizgileri kalin dörtgen (quad) olarak ciziyoruz
+                  RenderSystem.setShader(ShaderProgramKeys.POSITION_COLOR);
+
+                  BufferBuilder buf = Tessellator.getInstance().begin(VertexFormat.DrawMode.QUADS, VertexFormats.POSITION_COLOR);
+                  Matrix4f m = matrices.peek().getPositionMatrix();
+                  double t = (System.nanoTime() / 1_000_000_000.0) * (20.0 * speed * 0.5);
+
+                  for (DropPath p : paths) {
+                      List<Vec3d> pts = p.points;
+                      int segs = pts.size() - 1;
+                      if (segs < 1) continue;
+                      int r = (p.rgb >> 16) & 255, g = (p.rgb >> 8) & 255, b = p.rgb & 255;
+
+                      for (int i = 0; i < segs; i++) {
+                          seg(m, buf, pts.get(i).subtract(cam), pts.get(i + 1).subtract(cam), 1.0f, r, g, b, 190);
+                      }
+
+                      // Dusecegi nokta: dolu kare
+                      Vec3d land = pts.get(segs).subtract(cam);
+                      float x = (float) land.x, y = (float) land.y + 0.03f, z = (float) land.z, h = 0.3f;
+                      buf.vertex(m, x - h, y, z - h).color(r, g, b, 150);
+                      buf.vertex(m, x - h, y, z + h).color(r, g, b, 150);
+                      buf.vertex(m, x + h, y, z + h).color(r, g, b, 150);
+                      buf.vertex(m, x + h, y, z - h).color(r, g, b, 150);
+
+                      // Cizgi boyunca akan parlak parca (Speed ile hizlanir / yavaslar)
+                      double idx = t % segs;
+                      int i0 = (int) idx;
+                      double f = idx - i0;
+                      int i1 = Math.min(i0 + 1, segs - 1);
+                      Vec3d s0 = pts.get(i0).lerp(pts.get(i0 + 1), f).subtract(cam);
+                      Vec3d s1 = pts.get(i1).lerp(pts.get(i1 + 1), f).subtract(cam);
+                      seg(m, buf, s0, s1, 2.2f, 255, 255, 255, 255);
+                  }
+
+                  BuiltBuffer built = buf.endNullable();
+                  if (built != null) BufferRenderer.drawWithGlobalProgram(built);
+
+                  RenderSystem.enableCull();
+                  RenderSystem.enableDepthTest();
+                  RenderSystem.disableBlend();
+              }
+
+              /** Kameraya donuk kalin cizgi (quad). Mesafe arttikca kalinlik de artar, uzaktan da gorunur. */
+              static void seg(Matrix4f m, BufferBuilder buf, Vec3d a, Vec3d b, float widthMul,
+                              int r, int g, int bl, int al) {
+                  Vec3d dir = b.subtract(a);
+                  if (dir.lengthSquared() < 1.0e-8) return;
+                  Vec3d mid = a.add(b).multiply(0.5);
+                  Vec3d side = dir.crossProduct(mid);
+                  if (side.lengthSquared() < 1.0e-10) side = dir.crossProduct(new Vec3d(0, 1, 0));
+                  if (side.lengthSquared() < 1.0e-10) side = dir.crossProduct(new Vec3d(1, 0, 0));
+                  double half = (0.015 + 0.004 * mid.length()) * widthMul;
+                  side = side.normalize().multiply(half);
+
+                  float ax1 = (float) (a.x + side.x), ay1 = (float) (a.y + side.y), az1 = (float) (a.z + side.z);
+                  float ax2 = (float) (a.x - side.x), ay2 = (float) (a.y - side.y), az2 = (float) (a.z - side.z);
+                  float bx1 = (float) (b.x + side.x), by1 = (float) (b.y + side.y), bz1 = (float) (b.z + side.z);
+                  float bx2 = (float) (b.x - side.x), by2 = (float) (b.y - side.y), bz2 = (float) (b.z - side.z);
+
+                  buf.vertex(m, ax1, ay1, az1).color(r, g, bl, al);
+                  buf.vertex(m, ax2, ay2, az2).color(r, g, bl, al);
+                  buf.vertex(m, bx2, by2, bz2).color(r, g, bl, al);
+                  buf.vertex(m, bx1, by1, bz1).color(r, g, bl, al);
+              }
+
+              // ---------- Menu: G tusu VEYA Esc menusundeki "Item Drop" butonu ----------
+              static class Menu extends Screen {
+                  private final Screen parent;
+
+                  Menu(Screen parent) {
+                      super(Text.literal("Item Drop"));
+                      this.parent = parent;
+                  }
+
+                  static Text toggleLabel() { return Text.literal("Item Drop: " + (enabled ? "ON" : "OFF")); }
+                  static Text speedLabel() { return Text.literal("Speed: " + speed + " (1-5)"); }
+
+                  @Override
+                  protected void init() {
+                      int cx = width / 2, y = height / 2 - 45;
+                      // Buyuk, parmakla kolay basilan butonlar
+                      addDrawableChild(ButtonWidget.builder(toggleLabel(), b -> {
+                          enabled = !enabled;
+                          b.setMessage(toggleLabel());
+                      }).dimensions(cx - 110, y, 220, 30).build());
+
+                      addDrawableChild(ButtonWidget.builder(speedLabel(), b -> {
+                          speed = speed % 5 + 1;
+                          b.setMessage(speedLabel());
+                      }).dimensions(cx - 110, y + 36, 220, 30).build());
+
+                      addDrawableChild(ButtonWidget.builder(Text.literal("Done"), b -> close())
+                              .dimensions(cx - 110, y + 72, 220, 30).build());
+                  }
+
+                  @Override
+                  public void render(DrawContext ctx, int mx, int my, float delta) {
+                      super.render(ctx, mx, my, delta);
+                      ctx.drawCenteredTextWithShadow(textRenderer, title, width / 2, height / 2 - 65, 0xFFFFFFFF);
+                  }
+
+                  @Override
+                  public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+                      if (keyCode == GLFW.GLFW_KEY_G) { close(); return true; }
+                      return super.keyPressed(keyCode, scanCode, modifiers);
+                  }
+
+                  @Override
+                  public void close() {
+                      if (client != null) client.setScreen(parent);
+                  }
+
+                  @Override
+                  public boolean shouldPause() { return false; }
+              }
+          }
+          EOF
+      - run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ItemDrop-mobile-jar
+          path: build/libs/itemdrop-1.0.0.jar
